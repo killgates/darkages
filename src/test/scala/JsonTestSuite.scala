@@ -6,9 +6,9 @@ class JsonTestSuite extends AnyFunSuite:
 
   test("ConfigMap test") {
     val s = """ {"abc": 123, "kafka_server": "10.194.148.55", "web_name": "oops", "err": false } """
-    val result = Util.Json.read[Util.ConfigMap](s)
+    val result = Util.Json.read[Util.ConfigBundle](s)
     assert(result.getInt("abc").get == 123)
-    assert(!result.getBoolean("err"))
+    assert(!result.check("err"))
     assert(result.getString("kafka_server").get == "10.194.148.55")
   }
 

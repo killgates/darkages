@@ -16,7 +16,16 @@ object DBAgent:
 
   case class TimeOut(v: Duration=Duration.ofSeconds(30))
 
+  case class SqlNull(sqlType: Int)
+
   given TimeOut = TimeOut()
+
+  def paramRefPKInt(pk: Int): Any =
+    if pk > 0 then
+      pk
+    else
+      SqlNull(java.sql.Types.INTEGER)
+
 
   object DBWorker:
     trait DBContext:
@@ -35,9 +44,12 @@ object DBAgent:
           case x: LocalTime => st.setTime(n, Time.valueOf(x))
           case x: LocalDate => st.setDate(n, Date.valueOf(x))
           case x: LocalDateTime => st.setTimestamp(n, Timestamp.valueOf(x))
+          case x: SqlNull => st.setNull(n, x.sqlType)
+          case x => throw RuntimeException(s"運行SQL使用了未知類型的參數：$x")
         }
       }
       st
+
 
   trait DBWorker:
     protected var _startTime: Instant = Instant.MAX
@@ -115,6 +127,10 @@ object DBAgent:
 
     def decision: Int = _decision
 
+    def dispose(): Unit =
+      _statement match
+        case Some(st) => st.close()
+        case _ =>
 
   object SqlTask:
     type Guide = (Statement, Option[ResultSet], Option[Any]) => Int
@@ -139,10 +155,10 @@ object DBAgent:
       else
         val uSql = sql.toUpperCase()
         uSql match
-          case s if s.contains("SELECT") => 1
           case s if s.contains("RETURNING") => 10
           case s if s.contains("INSERT") || s.contains("UPDATE") => 2
           case s if s.contains("CREATE") || s.contains("DELETE") => 3
+          case s if s.contains("SELECT") => 1
           case _ => -1
       end if
 
@@ -154,11 +170,12 @@ object DBAgent:
     private var _result: Option[SqlResult] = None
     var affectedRows: Int = -1
     var info: String = ""
+    //    var onComplete: Option[SqlTask=>Unit] = None
 
     def result: SqlResult =
       _result match
         case Some(x) => x
-        case _ => throw RuntimeException(s"No result, sql statement is running")
+        case _ => throw RuntimeException(s"SQL尚未執行完畢")
 
     protected[darkages] def result_=(v: SqlResult): Unit =
       _result = Some(v)
@@ -179,18 +196,19 @@ object DBAgent:
 
     def execTag: Int = _execTag
 
-    def setCommit(): Unit =
-      _log.debug(s"SqlTask(${sql}) is set to commit")
-      _postCmd = Some({ctx =>
-        if !ctx.conn.getAutoCommit then
-          _log.debug("Commit...")
-          ctx.conn.commit()
-      })
+    def setCommit(arbi: Boolean=true): Unit =
+      if arbi || _stKind != 1 then
+        _log.debug(s"SqlTask(${sql}) 設置爲任務結束提交更新")
+        _postCmd = Some({ctx =>
+          if !ctx.conn.getAutoCommit then
+            _log.debug("提交更新...")
+            ctx.conn.commit()
+        })
 
     def setRollBack(): Unit =
       _postCmd = Some({ ctx =>
         if !ctx.conn.getAutoCommit then
-          _log.debug("Roll back...")
+          _log.debug("取消更新...")
           ctx.conn.rollback()
       })
 
@@ -207,7 +225,7 @@ object DBAgent:
       ctx => {
         _prevCmd match
           case Some(cmd) =>
-            _log.debug("Perform PRE command...")
+            _log.debug("運行SQL前置命令...")
             cmd(ctx)
           case _ =>
 
@@ -229,14 +247,14 @@ object DBAgent:
                 stx.execute()
                 val rs = stx.getResultSet
                 SqlResult(stx, Some(rs), -1, "SUCCESS", decision = _checkResult(stx, Some(rs)))
-              case _ => SqlResult(s"Unknown sql statement: $stx")
+              case _ => SqlResult(s"不支持的SQL: $stx")
 
           case _ =>
-            SqlResult("Illegal sql statement")
+            SqlResult("SQL語句異常")
 
         _postCmd match
           case Some(cmd) =>
-            _log.debug("Perform POST command...")
+            _log.debug("運行SQL後置命令...")
             cmd(ctx)
           case _ =>
         runResult
@@ -306,7 +324,8 @@ object DBAgent:
       _nextKey = r.decision
 
 
-  class NaDBWorker(val url: String, val username: String, val password: String, private val _autoCommit: Boolean = false) extends DBWorker:
+  class NaDBWorker(val url: String = "jdbc:kingbase8://10.201.47.4:54321/gisdata", val username: String = "SYSTEM",
+                   val password: String = "Gzsdz@123dcy", private val _autoCommit: Boolean = false) extends DBWorker:
     private var _conn: Option[Connection] = None
     private var _connFingerprint: UUID = UUID.randomUUID()
     private var _task: Option[SqlTask] = None
@@ -324,11 +343,11 @@ object DBAgent:
     private val _self = this
 
     private val _th = new Thread({()=>
-      _log.debug(s"NaDBWorker[${_self.id}] starting...")
+      _log.debug(s"NaDBWorker[${_self.id}] 啓動...")
       while _active do
         try
           _startTime = Instant.now()
-          _log.debug(s"[Worker: ${id}]: Fetch next Task...")
+          _log.debug(s"[Worker: ${id}]: 獲取下一個Task...")
           val task = _execTask match
             case Some(tx) =>
               tx
@@ -337,26 +356,25 @@ object DBAgent:
               val tx = _waitForTask()
               _execTask = Some(tx)
               tx
-          _log.debug(s"[Worker: ${id}]: SqlTask(${task}) has been obtained, run it...")
+          _log.debug(s"[Worker: ${id}]: 獲取SqlTask(${task}), 運行之...")
           task.status = SqlTaskStatus.Running
           task.attachToWorker(this)
           task.result = task.runner(currContext)
-          //          _log.debug(s"[Worker: ${id}]: SqlTask completed")
+          //          _log.debug(s"[Worker: ${id}]: SqlTask運行完成")
           task.status = SqlTaskStatus.Succ
           _finishTime = Instant.now()
-          //          _log.debug(s"[Worker: ${id}]: Notify SqlTask completion...")
+          //          _log.debug(s"[Worker: ${id}]: 通知SqlTask完成...")
           _notifyComplete()
           _execTask = None
-          //          _log.debug(s"[Worker: ${id}]: The running turn is ok, next...")
+          //          _log.debug(s"[Worker: ${id}]: 一次執行完成，進行下一次...")
         catch
           case _: InterruptedException =>
-            _handleEx(None, "Database access thread is break, try again...", 0, stopTask = false)
+            _handleEx(None, "數據訪問線程被中斷，從頭開始...", 0, stopTask = false)
           case ex: Exception =>
             val sErr = _execTask match
               case Some(task) => s"sql= ${task.toString}"
               case _ => ""
-            _execTask = None
-            _handleEx(Some(ex), s"Database operation is failed! ${sErr}")
+            _handleEx(Some(ex), s"數據庫操作失敗 sql= ${sErr}")
       end while
     }, s"DBWorker#${_self.id}")
 
@@ -399,7 +417,7 @@ object DBAgent:
     def engagedBy: Option[UUID] = _engagedBy
 
     override def check(): Unit =
-      _log.debug(s"Checking database connection[${id}]:...")
+      _log.debug(s"正在檢查數據庫連接[${id}]:...")
       _lock.lock()
       try
         val tn = Instant.now()
@@ -408,7 +426,7 @@ object DBAgent:
           _idleTime = tn
         end if
         if Duration.between(_idleTime, tn).getSeconds > 600 && _conn.nonEmpty then
-          _log.debug(s"Database connection is idling, break it！")
+          _log.debug(s"數據庫連接已經空閒過長時間，斷開！")
           _disconnect()
       finally
         _lock.unlock()
@@ -419,10 +437,10 @@ object DBAgent:
       }
 
     override def runTask(t: SqlTask, timeOut: Duration=Duration.ofSeconds(10), ownKey: Option[UUID]=None): Unit =
-      _log.debug(s"[Thread: ${Thread.currentThread().getId}]@<$id> runTask: running SqlTask => ${t.label}#${t.execTag}... ")
+      _log.debug(s"[Thread: ${Thread.currentThread().getId}]@<$id> runTask: 運行SqlTask => ${t.label}#${t.execTag}... ")
       _setTask(t, ownKey)
       setTimeOut(timeOut)
-      //      _log.debug(s"[Worker: ${id}] runTask: Wait for task completion...")
+      //      _log.debug(s"[Worker: ${id}] runTask: 等等運行完成...")
       _waitForResult(t)
 
     private def _setTask(t: SqlTask, ownKey: Option[UUID]=None): Unit =
@@ -434,7 +452,7 @@ object DBAgent:
             case Some(k) =>
               val h = {() => {_engagedBy.nonEmpty && k != _engagedBy.get}}
               while h() do
-                _log.debug(s"Worker is engaged，waiting for its releasing...")
+                _log.debug(s"Worker已被佔用，等待釋放...")
                 _released.await()
               _installTask(t, () => !h())
             case _ =>
@@ -446,18 +464,18 @@ object DBAgent:
         _lock.unlock()
 
     private def _installTask(t: SqlTask, instCri: ()=> Boolean): Boolean =
-      //      _log.debug("Installing SqlTask...")
+      //      _log.debug("安放SqlTask...")
       while _task.nonEmpty do
-        _log.debug(s"Worker is running other task, waiting ...")
+        _log.debug(s"Worker正在執行其他task, 等...")
         _noTask.await()
-        _log.debug(s"Worker has idled...")
+        _log.debug(s"Worker已經空閒...")
       if instCri() then
         t.status = SqlTaskStatus.Fresh
         _task = Some(t)
         _hasTask.signalAll()
         true
       else
-        _log.debug(s"Can't to install the task，maybe because of (${_engagedBy})")
+        _log.debug(s"條件不滿足，失敗(${_engagedBy})")
         false
 
     private def _waitForTask(): SqlTask =
@@ -487,14 +505,14 @@ object DBAgent:
     private def _waitForResult(t: SqlTask): Boolean =
       _lock.lock()
       try
-        //        _log.debug("Waiting for database operation result...")
+        //        _log.debug("等待數據庫操作結果...")
         while t.status != SqlTaskStatus.Succ && t.status != SqlTaskStatus.Err do
           _taskCompleted.await()
-        //        _log.debug("Database operation ok")
+        //        _log.debug("數據庫操作已正常完成")
         true
       catch
         case ex: Exception =>
-          _log.error(s"Database operation error: ${ex.toString}")
+          _log.error(s"數據庫操作已出錯: ${ex.toString}")
           false
       finally
         _lock.unlock()
@@ -558,7 +576,8 @@ object DBAgent:
       lx.unlock()
 
 
-class DBAgent(val url: String, private val username: String, private val password: String, private val _autoCommit: Boolean=false, poolSize: Int=2):
+class DBAgent(val url: String="jdbc:kingbase8://10.201.47.4:54321/gisdata", private val username: String="SYSTEM",
+              private val password: String="Gzsdz@123dcy", private val _autoCommit: Boolean=false, poolSize: Int=2):
   private lazy val _workers = {
     val t = mutable.ArrayBuffer[DBAgent.DBWorker]()
     for i <- 1 to poolSize do
@@ -584,12 +603,12 @@ class DBAgent(val url: String, private val username: String, private val passwor
 
 
   def query(sql: String, args: Any*)(using timeOut: DBAgent.TimeOut): DBAgent.SqlResult =
-    //    _log.debug("Choose a worker...")
+    //    _log.debug("選擇Worker...")
     val worker = _electWorker()
-    //    _log.debug(s"Worker has been chose：${worker.id}, creating a SqlTask...")
+    //    _log.debug(s"Worker已選定：${worker.id}, 創建SqlTask...")
     val t = DBAgent.SqlTask(sql, args: _*)
-    t.setCommit()
-    //    _log.debug(s"SqlTask is created，run it...")
+    t.setCommit(false)
+    //    _log.debug(s"SqlTask創建完畢，運行之...")
     worker.runTask(t, timeOut = timeOut.v)
     t.result
 
@@ -628,6 +647,14 @@ class DBAgent(val url: String, private val username: String, private val passwor
     worker.runTask(t, timeOut = timeOut.v, ownKey = Some(pId))
     t.result
 
+  def runTask(pId: UUID, task: DBAgent.SqlTask, commit: Boolean = false)(using timeOut: DBAgent.TimeOut): DBAgent.SqlResult =
+    val worker = _retrieveWorker(pId)
+    worker.setTimeOut(timeOut.v)
+    task.setCommit(commit)
+    worker.runTask(task, timeOut = timeOut.v, ownKey = Some(pId))
+    task.result
+
+
   def execJob[T](job: DBAgent.SqlJob, onTaskComplete: Option[DBAgent.SqlTask=>Option[T]]=None)
                 (using timeOut: DBAgent.TimeOut, executionContext: ExecutionContext): Future[Seq[T]] =
     Future {
@@ -635,7 +662,7 @@ class DBAgent(val url: String, private val username: String, private val passwor
       try
         val result = mutable.ArrayBuffer[T]()
         job.tasks() foreach { tg =>
-          //          _log.debug(s"SqlJob(${job.id.toString}): generating next Task...")
+          //          _log.debug(s"SqlJob(${job.id.toString}): 生成下一個Task...")
           val t = tg()
           //          _log.debug(s"SqlJob(${job.id.toString}): Task=>${t}")
           val wx = worker match
@@ -646,10 +673,10 @@ class DBAgent(val url: String, private val username: String, private val passwor
               w.setTimeOut(timeOut.v)
               worker = Some(w)
               w
-          //          _log.debug(s"SqlJob(${job.id.toString}): Obtain a worker: ${wx.id}")
+          //          _log.debug(s"SqlJob(${job.id.toString}): 取得Worker: ${wx.id}")
           wx.runTask(t, ownKey = Some(job.id))
           if t.status == DBAgent.SqlTaskStatus.Err then
-            throw RuntimeException(s"Running sql statement Error: ${t.info}")
+            throw RuntimeException(s"執行SQL出錯: ${t.info}")
           onTaskComplete match
             case Some(f) =>
               f(t) match
@@ -663,7 +690,7 @@ class DBAgent(val url: String, private val username: String, private val passwor
           worker.get.runTask(tx, ownKey = Some(job.id))
         result.toSeq
       finally
-        DBAgent._log.debug(s"SqlJob(${job.id.toString}): SQLJob OK！")
+        DBAgent._log.debug(s"SqlJob(${job.id.toString}): SQLJob運行完成！")
         worker match
           case Some(w) => w.giveUp()
           case _ =>

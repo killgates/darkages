@@ -60,7 +60,7 @@ object TableImpl extends DBTable.Factory:
           val fldName = fx.name.trim.toLowerCase
           val fldVirtName = MFactory.normalizeFldName(fx.virtName)
           val (dt, defVal, accFun) = fx.dataType.toUpperCase() match
-            case s if s.contains("CHAR") || s.contains("VARCHAR") => (DBField.DataType.STR, Util.fixStr(fx.defaultVal, ""), None)
+            case s if s.contains("CHAR") || s.contains("VARCHAR") => (DBField.DataType.STR, Util.fixVal(fx.defaultVal, ""), None)
             case s if s == "INT" || s == "INTEGER" => (DBField.DataType.INT, Util.fixVal(fx.defaultVal.toInt, 0), None)
             case s if s.contains("TIMESTAMP") || s.contains("DATETIME") =>
               if fx.defaultVal.nonEmpty then
